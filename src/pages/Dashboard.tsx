@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import { Activity, AlertTriangle, CarFront, ClipboardList, Clock3, FileWarning, Sparkles, TimerReset } from 'lucide-react';
+import { Activity, AlertTriangle, CarFront, ClipboardList, Clock3, FileWarning, MessageCircle, PauseCircle, Sparkles, TimerReset } from 'lucide-react';
 import { api, formatDate, relativeTime } from '../lib/api';
 import { useApp } from '../context/AppContext';
+import type { DelaysResponse, Driver, Occurrence, SlaStatus, WhatsappStatus } from '../lib/types';
 import { Badge, Button, Card, CardHeader, EmptyState, PageHeader, Skeleton, StatCard, Tabs } from '../components/ui';
 
 interface DashboardData {
@@ -29,25 +30,88 @@ interface DashboardData {
   summarySource: string;
 }
 
+interface ListResponse<T> {
+  items: T[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+interface AttentionData {
+  delays: DelaysResponse;
+  paused: ListResponse<Occurrence>;
+  pendingDrivers: ListResponse<Driver>;
+  expiringDrivers: ListResponse<Driver>;
+  whatsapp: WhatsappStatus;
+}
+
 const pieColors = ['#3B82F6', '#22C55E', '#F59E0B', '#EF4444', '#8B5CF6', '#06B6D4', '#EC4899', '#64748B'];
+
+function occurrenceCode(number: number): string {
+  return `OC-${String(number).padStart(5, '0')}`;
+}
+
+function formatMinutes(value: number): string {
+  const minutes = Math.round(value);
+  const absolute = Math.abs(minutes);
+  const days = Math.floor(absolute / 1440);
+  const hours = Math.floor((absolute % 1440) / 60);
+  const remainder = absolute % 60;
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0) parts.push(`${hours}h`);
+  if (remainder > 0 || parts.length === 0) parts.push(`${remainder}min`);
+  return minutes < 0 ? `${parts.join(' ')} excedidos` : parts.join(' ');
+}
+
+function slaTone(status: SlaStatus): 'neutral' | 'success' | 'info' | 'warning' | 'danger' {
+  if (status === 'overdue' || status === 'breached') return 'danger';
+  if (status === 'due_soon') return 'warning';
+  if (status === 'paused') return 'neutral';
+  if (status === 'met') return 'success';
+  return 'info';
+}
+
+function slaLabel(status: SlaStatus): string {
+  const labels: Record<SlaStatus, string> = {
+    on_track: 'No prazo',
+    due_soon: 'Próxima do prazo',
+    overdue: 'Atrasada',
+    paused: 'SLA pausado',
+    met: 'SLA cumprido',
+    breached: 'SLA rompido'
+  };
+  return labels[status];
+}
 
 export function DashboardPage() {
   const { toast } = useApp();
   const [data, setData] = useState<DashboardData | null>(null);
+  const [attention, setAttention] = useState<AttentionData | null>(null);
   const [chartMode, setChartMode] = useState<'day' | 'week' | 'month'>('day');
 
   useEffect(() => {
-    api<DashboardData>('/dashboard')
-      .then(setData)
+    Promise.all([
+      api<DashboardData>('/dashboard'),
+      api<DelaysResponse>('/ai/delays', { method: 'POST', body: JSON.stringify({}) }),
+      api<ListResponse<Occurrence>>('/occurrences?sla=paused&limit=5&sort=due'),
+      api<ListResponse<Driver>>('/drivers?pendingDocuments=1&limit=5'),
+      api<ListResponse<Driver>>('/drivers?expiring=1&limit=5'),
+      api<WhatsappStatus>('/whatsapp/status')
+    ])
+      .then(([dashboard, delays, paused, pendingDrivers, expiringDrivers, whatsapp]) => {
+        setData(dashboard);
+        setAttention({ delays, paused, pendingDrivers, expiringDrivers, whatsapp });
+      })
       .catch((error) => toast(error instanceof Error ? error.message : 'Erro ao carregar dashboard.', 'error'));
   }, []);
 
-  if (!data) {
+  if (!data || !attention) {
     return (
       <div className="space-y-4">
         <Skeleton className="h-8 w-56" />
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-          {[0, 1, 2, 3].map((key) => <Skeleton key={key} className="h-28" />)}
+          {[0, 1, 2, 3, 4, 5, 6, 7].map((key) => <Skeleton key={key} className="h-28" />)}
         </div>
         <Skeleton className="h-80" />
       </div>
@@ -56,6 +120,12 @@ export function DashboardPage() {
 
   const chartData = data.charts[chartMode];
   const hasOccurrences = data.metrics.open + data.metrics.concluded > 0;
+  const dueSoonAlerts = attention.delays.alerts.filter((item) => item.slaStatus === 'due_soon');
+  const overdueAlerts = attention.delays.alerts.filter((item) => item.slaStatus === 'overdue');
+  const allAlerts = [...overdueAlerts, ...dueSoonAlerts];
+  const driversToReview = new Map<string, Driver>();
+  for (const driver of attention.pendingDrivers.items) driversToReview.set(driver.id, driver);
+  for (const driver of attention.expiringDrivers.items) driversToReview.set(driver.id, driver);
 
   return (
     <div>
@@ -79,6 +149,91 @@ export function DashboardPage() {
         <StatCard label="Motoristas" value={data.metrics.drivers} icon={<CarFront className="h-4 w-4" />} tone="info" />
         <StatCard label="Cadastros pendentes" value={data.metrics.pendingDrivers} icon={<ClipboardList className="h-4 w-4" />} tone="warning" />
         <StatCard label="CNHs próximas do vencimento" value={data.metrics.expiringDocuments} icon={<FileWarning className="h-4 w-4" />} tone="danger" />
+      </div>
+
+      <div className="mt-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard label="SLA atrasadas" value={data.metrics.overdue} icon={<AlertTriangle className="h-4 w-4" />} tone="danger" hint={`${overdueAlerts.length} alerta(s) ativo(s)`} />
+        <StatCard label="Próximas do prazo" value={dueSoonAlerts.length} icon={<Clock3 className="h-4 w-4" />} tone="warning" hint="Calculado pelas regras de SLA" />
+        <StatCard label="SLA pausadas" value={attention.paused.total} icon={<PauseCircle className="h-4 w-4" />} tone="neutral" hint="Aguardando cliente, transportadora ou motorista" />
+        <StatCard label="Motoristas a revisar" value={driversToReview.size} icon={<FileWarning className="h-4 w-4" />} tone="warning" hint={`${attention.pendingDrivers.total} pendentes • ${attention.expiringDrivers.total} vencendo`} />
+      </div>
+
+      {!attention.whatsapp.configured && (
+        <Card className="mt-4 border-warning/40">
+          <div className="flex flex-wrap items-center justify-between gap-3 p-5">
+            <div className="flex items-start gap-3">
+              <MessageCircle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+              <div>
+                <p className="text-sm font-medium text-ink">WhatsApp não configurado</p>
+                <p className="mt-1 text-xs text-muted">Variáveis ausentes: {attention.whatsapp.missing.join(', ') || 'nenhuma'}.</p>
+              </div>
+            </div>
+            <Link to="/configuracoes?tab=integracoes"><Button>Configurar integração</Button></Link>
+          </div>
+        </Card>
+      )}
+
+      <div className="mt-6 grid gap-6 xl:grid-cols-3">
+        <Card>
+          <CardHeader title="Alertas de SLA" description="Atrasadas e próximas do prazo" />
+          <div className="divide-y divide-line/60">
+            {allAlerts.length === 0 ? (
+              <EmptyState title="Nenhum alerta de SLA" description="Não há prazos vencidos ou próximos no momento." />
+            ) : (
+              allAlerts.map((item) => (
+                <Link key={item.id} to={`/ocorrencias/${item.id}`} className="flex items-center justify-between gap-3 px-5 py-3 hover:bg-line/20">
+                  <div className="min-w-0">
+                    <p className="truncate text-xs font-medium text-ink">{occurrenceCode(item.number)} • {item.customerName}</p>
+                    <p className="mt-0.5 text-[11px] text-muted">{formatMinutes(item.remainingMinutes)} • {formatDate(item.dueAt)}</p>
+                  </div>
+                  <Badge tone={slaTone(item.slaStatus)}>{slaLabel(item.slaStatus)}</Badge>
+                </Link>
+              ))
+            )}
+          </div>
+        </Card>
+
+        <Card>
+          <CardHeader title="SLA pausadas" description="Prazo suspenso por status configurado" />
+          <div className="divide-y divide-line/60">
+            {attention.paused.items.length === 0 ? (
+              <EmptyState title="Nenhuma ocorrência pausada" description="O prazo volta a correr quando o status é alterado." />
+            ) : (
+              attention.paused.items.map((item) => (
+                <Link key={item.id} to={`/ocorrencias/${item.id}`} className="flex items-center justify-between gap-3 px-5 py-3 hover:bg-line/20">
+                  <div className="min-w-0">
+                    <p className="truncate text-xs font-medium text-ink">{item.code} • {item.customerName}</p>
+                    <p className="mt-0.5 text-[11px] text-muted">{item.status} • {formatDate(item.dueAt)}</p>
+                  </div>
+                  <Badge tone="neutral">{item.sla.pausedMinutes}min pausadas</Badge>
+                </Link>
+              ))
+            )}
+          </div>
+        </Card>
+
+        <Card>
+          <CardHeader title="Documentos de motoristas" description="Pendências e validades próximas" />
+          <div className="divide-y divide-line/60">
+            {driversToReview.size === 0 ? (
+              <EmptyState title="Nenhuma pendência" description="Não há documentos pendentes ou próximos do vencimento." />
+            ) : (
+              [...driversToReview.values()].map((driver) => (
+                <Link key={driver.id} to={`/motoristas/${driver.id}`} className="flex items-center justify-between gap-3 px-5 py-3 hover:bg-line/20">
+                  <div className="min-w-0">
+                    <p className="truncate text-xs font-medium text-ink">{driver.name}</p>
+                    <p className="mt-0.5 text-[11px] text-muted">{driver.status} • {driver.pendingDocuments} pendente(s)</p>
+                  </div>
+                  <div className="flex flex-wrap justify-end gap-1">
+                    {driver.pendingDocuments > 0 && <Badge tone="warning">Pendente</Badge>}
+                    {(driver.cnhAlert === 'soon' || driver.expiringDocuments > 0) && <Badge tone="warning">Vencendo</Badge>}
+                    {driver.cnhAlert === 'expired' && <Badge tone="danger">Vencida</Badge>}
+                  </div>
+                </Link>
+              ))
+            )}
+          </div>
+        </Card>
       </div>
 
       <div className="mt-6 grid gap-6 xl:grid-cols-3">

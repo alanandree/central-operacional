@@ -3,15 +3,29 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { ClipboardList, Pencil, Plus, Trash2 } from 'lucide-react';
 import { api, formatDate } from '../lib/api';
 import { useApp } from '../context/AppContext';
-import type { Category, Occurrence } from '../lib/types';
+import type { Category, Occurrence, SlaStatus } from '../lib/types';
 import { OCCURRENCE_STATUSES, PRIORITIES } from '../lib/types';
-import { Badge, Button, Card, ConfirmDialog, EmptyState, Field, Input, Modal, PageHeader, Select, Textarea } from '../components/ui';
+import { Badge, Button, Card, ConfirmDialog, EmptyState, Field, Input, Modal, PageHeader, Select, Skeleton, Textarea } from '../components/ui';
 
 interface ListResponse {
   items: Occurrence[];
   total: number;
   page: number;
   limit: number;
+}
+
+interface Filters {
+  search: string;
+  categoryId: string;
+  status: string;
+  priority: string;
+  responsible: string;
+  from: string;
+  to: string;
+  closedFrom: string;
+  closedTo: string;
+  sla: string;
+  sort: string;
 }
 
 type FormState = {
@@ -28,6 +42,24 @@ type FormState = {
   priority: string;
   dueAt: string;
   status: string;
+  closeReason: string;
+};
+
+const PAGE_SIZE = 20;
+const CLOSED_STATUSES = ['Resolvida', 'Encerrada'];
+
+const emptyFilters: Filters = {
+  search: '',
+  categoryId: '',
+  status: '',
+  priority: '',
+  responsible: '',
+  from: '',
+  to: '',
+  closedFrom: '',
+  closedTo: '',
+  sla: '',
+  sort: 'created'
 };
 
 const emptyForm: FormState = {
@@ -43,7 +75,8 @@ const emptyForm: FormState = {
   responsible: '',
   priority: 'Normal',
   dueAt: '',
-  status: 'Nova ocorrência'
+  status: 'Nova',
+  closeReason: ''
 };
 
 function localDateTime(value: string | null | undefined): string {
@@ -53,9 +86,13 @@ function localDateTime(value: string | null | undefined): string {
   return new Date(date.getTime() - offset).toISOString().slice(0, 16);
 }
 
+function isClosedStatus(status: string): boolean {
+  return CLOSED_STATUSES.includes(status);
+}
+
 function statusTone(status: string): 'neutral' | 'success' | 'info' | 'warning' | 'danger' {
-  if (status === 'Resolvida' || status === 'Encerrada') return 'success';
-  if (status === 'Aguardando retorno' || status === 'Aguardando cliente' || status === 'Aguardando transportadora') return 'warning';
+  if (isClosedStatus(status)) return 'success';
+  if (status.startsWith('Aguardando')) return 'warning';
   if (status === 'Em andamento' || status === 'Em análise') return 'info';
   return 'neutral';
 }
@@ -67,6 +104,53 @@ function priorityTone(priority: string): 'neutral' | 'info' | 'warning' | 'dange
   return 'neutral';
 }
 
+function slaTone(status: SlaStatus): 'neutral' | 'success' | 'info' | 'warning' | 'danger' {
+  if (status === 'overdue' || status === 'breached') return 'danger';
+  if (status === 'due_soon') return 'warning';
+  if (status === 'paused') return 'neutral';
+  if (status === 'met') return 'success';
+  return 'info';
+}
+
+function slaLabel(status: SlaStatus): string {
+  const labels: Record<SlaStatus, string> = {
+    on_track: 'No prazo',
+    due_soon: 'Próximo do prazo',
+    overdue: 'Atrasada',
+    paused: 'SLA pausado',
+    met: 'SLA cumprido',
+    breached: 'SLA rompido'
+  };
+  return labels[status];
+}
+
+function slaBarTone(status: SlaStatus): string {
+  if (status === 'overdue' || status === 'breached') return 'bg-danger';
+  if (status === 'due_soon') return 'bg-warning';
+  if (status === 'met') return 'bg-success';
+  if (status === 'paused') return 'bg-muted';
+  return 'bg-info';
+}
+
+function progressPercent(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function formatMinutes(value: number): string {
+  const minutes = Math.round(value);
+  const absolute = Math.abs(minutes);
+  const days = Math.floor(absolute / 1440);
+  const hours = Math.floor((absolute % 1440) / 60);
+  const remainder = absolute % 60;
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0) parts.push(`${hours}h`);
+  if (remainder > 0 || parts.length === 0) parts.push(`${remainder}min`);
+  const label = parts.join(' ');
+  return minutes < 0 ? `${label} (excedido)` : label;
+}
+
 export function OccurrencesPage() {
   const { user, toast } = useApp();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -74,7 +158,8 @@ export function OccurrencesPage() {
   const [categories, setCategories] = useState<Category[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
-  const [filters, setFilters] = useState({ search: '', status: '', priority: '', categoryId: '', from: '', to: '', sort: 'created' });
+  const [loading, setLoading] = useState(true);
+  const [filters, setFilters] = useState<Filters>(emptyFilters);
   const [modalOpen, setModalOpen] = useState(searchParams.get('new') === '1');
   const [editing, setEditing] = useState<Occurrence | null>(null);
   const [form, setForm] = useState<FormState>(emptyForm);
@@ -83,25 +168,39 @@ export function OccurrencesPage() {
   const [deleting, setDeleting] = useState(false);
 
   const load = async () => {
-    const params = new URLSearchParams({ page: String(page), limit: '20', sort: filters.sort });
+    setLoading(true);
+    const params = new URLSearchParams({ page: String(page), limit: String(PAGE_SIZE), sort: filters.sort });
     for (const [key, value] of Object.entries(filters)) {
       if (value && key !== 'sort') params.set(key, value);
     }
     try {
-      const data = await api<ListResponse>(`/occurrences?${params}`);
+      const data = await api<ListResponse>(`/occurrences?${params.toString()}`);
       setItems(data.items);
       setTotal(data.total);
     } catch (error) {
+      setItems([]);
+      setTotal(0);
       toast(error instanceof Error ? error.message : 'Erro ao carregar ocorrências.', 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadCategories = async () => {
+    try {
+      const data = await api<{ categories?: Category[]; items?: Category[] }>('/categories');
+      setCategories(data.categories ?? data.items ?? []);
+    } catch (error) {
+      toast(error instanceof Error ? error.message : 'Erro ao carregar categorias.', 'error');
     }
   };
 
   useEffect(() => {
     void load();
-  }, [page, filters.search, filters.status, filters.priority, filters.categoryId, filters.from, filters.to, filters.sort]);
+  }, [page, filters]);
 
   useEffect(() => {
-    api<{ categories: Category[] }>('/categories').then((data) => setCategories(data.categories)).catch(() => undefined);
+    void loadCategories();
   }, []);
 
   useEffect(() => {
@@ -111,6 +210,11 @@ export function OccurrencesPage() {
       setModalOpen(true);
     }
   }, [searchParams]);
+
+  const updateFilter = (key: keyof Filters, value: string) => {
+    setPage(1);
+    setFilters((current) => ({ ...current, [key]: value }));
+  };
 
   const openCreate = () => {
     setEditing(null);
@@ -133,26 +237,40 @@ export function OccurrencesPage() {
       origin: occurrence.origin,
       responsible: occurrence.responsible ?? '',
       priority: occurrence.priority,
-      dueAt: localDateTime(occurrence.dueAt),
-      status: occurrence.status
+      dueAt: localDateTime(occurrence.originalDueAt),
+      status: occurrence.status,
+      closeReason: occurrence.closeReason ?? ''
     });
     setModalOpen(true);
   };
 
   const save = async () => {
+    const closing = isClosedStatus(form.status);
+    if (!form.customerName.trim() || !form.description.trim()) {
+      toast('Informe o nome do cliente e a descrição do problema.', 'error');
+      return;
+    }
+    if (closing && form.closeReason.trim().length < 3) {
+      toast('Informe a justificativa de encerramento (mínimo de 3 caracteres).', 'error');
+      return;
+    }
     setSaving(true);
     try {
       const payload = {
-        ...form,
+        customerName: form.customerName.trim(),
         customerPhone: form.customerPhone || undefined,
         orderCode: form.orderCode || undefined,
         trackingCode: form.trackingCode || undefined,
         recipientName: form.recipientName || undefined,
-        categoryId: form.categoryId || null,
+        categoryId: form.categoryId || undefined,
+        description: form.description.trim(),
+        receivedAt: form.receivedAt ? new Date(form.receivedAt).toISOString() : undefined,
         origin: form.origin || 'Manual',
         responsible: form.responsible || undefined,
-        receivedAt: form.receivedAt ? new Date(form.receivedAt).toISOString() : undefined,
-        dueAt: form.dueAt ? new Date(form.dueAt).toISOString() : null
+        priority: form.priority,
+        dueAt: form.dueAt ? new Date(form.dueAt).toISOString() : undefined,
+        status: form.status,
+        closeReason: closing ? form.closeReason.trim() : undefined
       };
       if (editing) await api(`/occurrences/${editing.id}`, { method: 'PATCH', body: JSON.stringify(payload) });
       else await api('/occurrences', { method: 'POST', body: JSON.stringify(payload) });
@@ -181,6 +299,9 @@ export function OccurrencesPage() {
     }
   };
 
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const closing = isClosedStatus(form.status);
+
   return (
     <div>
       <PageHeader
@@ -190,32 +311,70 @@ export function OccurrencesPage() {
       />
 
       <Card className="mb-5 p-4">
-        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
-          <Input placeholder="Buscar cliente, pedido ou rastreamento" value={filters.search} onChange={(event) => { setPage(1); setFilters({ ...filters, search: event.target.value }); }} />
-          <Select value={filters.status} onChange={(event) => { setPage(1); setFilters({ ...filters, status: event.target.value }); }}>
-            <option value="">Todos os status</option>
-            {OCCURRENCE_STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}
-          </Select>
-          <Select value={filters.priority} onChange={(event) => { setPage(1); setFilters({ ...filters, priority: event.target.value }); }}>
-            <option value="">Todas as prioridades</option>
-            {PRIORITIES.map((priority) => <option key={priority} value={priority}>{priority}</option>)}
-          </Select>
-          <Select value={filters.categoryId} onChange={(event) => { setPage(1); setFilters({ ...filters, categoryId: event.target.value }); }}>
-            <option value="">Todas as categorias</option>
-            {categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
-          </Select>
-          <Input type="date" value={filters.from} onChange={(event) => { setPage(1); setFilters({ ...filters, from: event.target.value }); }} />
-          <Select value={filters.sort} onChange={(event) => setFilters({ ...filters, sort: event.target.value })}>
-            <option value="created">Mais recentes</option>
-            <option value="received">Recebimento</option>
-            <option value="due">Por prazo</option>
-            <option value="priority">Por prioridade</option>
-          </Select>
+        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-4">
+          <Field label="Busca">
+            <Input placeholder="Cliente, pedido, rastreamento ou código" value={filters.search} onChange={(event) => updateFilter('search', event.target.value)} />
+          </Field>
+          <Field label="Categoria">
+            <Select value={filters.categoryId} onChange={(event) => updateFilter('categoryId', event.target.value)}>
+              <option value="">Todas as categorias</option>
+              {categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
+            </Select>
+          </Field>
+          <Field label="Status">
+            <Select value={filters.status} onChange={(event) => updateFilter('status', event.target.value)}>
+              <option value="">Todos os status</option>
+              {OCCURRENCE_STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}
+            </Select>
+          </Field>
+          <Field label="Prioridade">
+            <Select value={filters.priority} onChange={(event) => updateFilter('priority', event.target.value)}>
+              <option value="">Todas as prioridades</option>
+              {PRIORITIES.map((priority) => <option key={priority} value={priority}>{priority}</option>)}
+            </Select>
+          </Field>
+          <Field label="Responsável">
+            <Input placeholder="Nome do responsável" value={filters.responsible} onChange={(event) => updateFilter('responsible', event.target.value)} />
+          </Field>
+          <Field label="Recebido de">
+            <Input type="date" value={filters.from} onChange={(event) => updateFilter('from', event.target.value)} />
+          </Field>
+          <Field label="Recebido até">
+            <Input type="date" value={filters.to} onChange={(event) => updateFilter('to', event.target.value)} />
+          </Field>
+          <Field label="Encerrado de">
+            <Input type="date" value={filters.closedFrom} onChange={(event) => updateFilter('closedFrom', event.target.value)} />
+          </Field>
+          <Field label="Encerrado até">
+            <Input type="date" value={filters.closedTo} onChange={(event) => updateFilter('closedTo', event.target.value)} />
+          </Field>
+          <Field label="SLA">
+            <Select value={filters.sla} onChange={(event) => updateFilter('sla', event.target.value)}>
+              <option value="">Todos</option>
+              <option value="overdue">Atrasadas</option>
+              <option value="paused">Com SLA pausado</option>
+            </Select>
+          </Field>
+          <Field label="Ordenação">
+            <Select value={filters.sort} onChange={(event) => updateFilter('sort', event.target.value)}>
+              <option value="created">Criação (recentes)</option>
+              <option value="recent">Recebimento (recentes)</option>
+              <option value="due">Por prazo</option>
+              <option value="priority">Por prioridade</option>
+            </Select>
+          </Field>
+        </div>
+        <div className="mt-3 flex justify-end">
+          <Button size="sm" onClick={() => { setPage(1); setFilters(emptyFilters); }}>Limpar filtros</Button>
         </div>
       </Card>
 
       <Card>
-        {items.length === 0 ? (
+        {loading ? (
+          <div className="space-y-3 p-5">
+            {[0, 1, 2, 3, 4].map((key) => <Skeleton key={key} className="h-12 w-full" />)}
+          </div>
+        ) : items.length === 0 ? (
           <EmptyState
             icon={<ClipboardList className="h-5 w-5" />}
             title="Nenhuma ocorrência encontrada"
@@ -224,7 +383,7 @@ export function OccurrencesPage() {
           />
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[900px] text-left text-sm">
+            <table className="w-full min-w-[1100px] text-left text-sm">
               <thead className="border-b border-line text-[11px] uppercase tracking-wide text-muted">
                 <tr>
                   <th className="px-5 py-3 font-medium">Código</th>
@@ -232,6 +391,7 @@ export function OccurrencesPage() {
                   <th className="px-4 py-3 font-medium">Categoria</th>
                   <th className="px-4 py-3 font-medium">Prioridade</th>
                   <th className="px-4 py-3 font-medium">Status</th>
+                  <th className="px-4 py-3 font-medium">SLA</th>
                   <th className="px-4 py-3 font-medium">Prazo</th>
                   <th className="px-5 py-3 text-right font-medium">Ações</th>
                 </tr>
@@ -241,16 +401,35 @@ export function OccurrencesPage() {
                   <tr key={item.id} className="hover:bg-line/20">
                     <td className="px-5 py-3">
                       <Link to={`/ocorrencias/${item.id}`} className="font-medium text-info hover:underline">{item.code}</Link>
-                      {item.overdue && <Badge tone="danger" className="ml-2">atrasada</Badge>}
                     </td>
                     <td className="px-4 py-3">
                       <p className="text-ink">{item.customerName}</p>
-                      <p className="text-[11px] text-muted">{item.orderCode ? `Pedido ${item.orderCode}` : 'Sem pedido'}</p>
+                      <p className="text-[11px] text-muted">
+                        {item.orderCode ? `Pedido ${item.orderCode}` : 'Sem pedido'}
+                        {item.trackingCode ? ` • Rastro ${item.trackingCode}` : ''}
+                      </p>
                     </td>
                     <td className="px-4 py-3 text-muted">{item.categoryName ?? 'Sem categoria'}</td>
                     <td className="px-4 py-3"><Badge tone={priorityTone(item.priority)}>{item.priority}</Badge></td>
                     <td className="px-4 py-3"><Badge tone={statusTone(item.status)}>{item.status}</Badge></td>
-                    <td className="px-4 py-3 text-xs text-muted">{formatDate(item.dueAt)}</td>
+                    <td className="px-4 py-3">
+                      <div className="flex w-32 flex-col gap-1">
+                        <Badge tone={slaTone(item.sla.status)}>{slaLabel(item.sla.status)}</Badge>
+                        <div className="h-1 w-full overflow-hidden rounded-full bg-line/60">
+                          <div className={`h-full rounded-full ${slaBarTone(item.sla.status)}`} style={{ width: `${progressPercent(item.sla.progress)}%` }} />
+                        </div>
+                        <span className="text-[11px] text-muted">
+                          {formatMinutes(item.sla.remainingMinutes)}
+                          {item.sla.status === 'paused' && item.sla.pausedMinutes > 0 ? ` • ${formatMinutes(item.sla.pausedMinutes)} pausados` : ''}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <p className="text-xs text-ink">{formatDate(item.sla.dueAt)}</p>
+                      {item.originalDueAt && item.originalDueAt !== item.sla.dueAt && (
+                        <p className="text-[11px] text-muted">Original: {formatDate(item.originalDueAt)}</p>
+                      )}
+                    </td>
                     <td className="px-5 py-3">
                       <div className="flex justify-end gap-1">
                         <Button variant="ghost" size="icon" title="Editar" onClick={() => openEdit(item)}><Pencil className="h-4 w-4" /></Button>
@@ -265,12 +444,14 @@ export function OccurrencesPage() {
             </table>
           </div>
         )}
-        {total > 20 && (
+        {!loading && total > 0 && (
           <div className="flex items-center justify-between border-t border-line px-5 py-3 text-xs text-muted">
-            <span>{total} ocorrências • página {page}</span>
+            <span>
+              {total} ocorrências • página {page} de {totalPages} • {items.length} nesta página
+            </span>
             <div className="flex gap-2">
-              <Button size="sm" disabled={page === 1} onClick={() => setPage(page - 1)}>Anterior</Button>
-              <Button size="sm" disabled={page * 20 >= total} onClick={() => setPage(page + 1)}>Próxima</Button>
+              <Button size="sm" disabled={page === 1} onClick={() => setPage((current) => Math.max(1, current - 1))}>Anterior</Button>
+              <Button size="sm" disabled={page >= totalPages} onClick={() => setPage((current) => current + 1)}>Próxima</Button>
             </div>
           </div>
         )}
@@ -310,6 +491,11 @@ export function OccurrencesPage() {
               {OCCURRENCE_STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}
             </Select>
           </Field>
+          {closing && (
+            <Field label="Justificativa de encerramento *" className="sm:col-span-2" hint="Obrigatório para Resolvida ou Encerrada (mínimo de 3 caracteres).">
+              <Textarea value={form.closeReason} onChange={(event) => setForm({ ...form, closeReason: event.target.value })} />
+            </Field>
+          )}
           <Field label="Descrição do problema *" className="sm:col-span-2">
             <Textarea value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} />
           </Field>

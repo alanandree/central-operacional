@@ -3,15 +3,30 @@ import bcrypt from 'bcryptjs';
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import { config } from '../config.ts';
-import { all, logActivity, newId, now, one, run } from '../db.ts';
+import { all, logActivity, newId, now, one, run, transaction } from '../db.ts';
 import { asyncRoute, auth, authRequired, companyId, fail, hashToken, signToken } from '../core.ts';
 import { sendResetEmail } from '../integrations.ts';
 import { saveFile, upload } from '../upload.ts';
+import { rateLimit } from '../security.ts';
 
 export const authRoutes = Router();
 
+const loginLimiter = rateLimit({ key: 'login', max: 8, windowMs: 15 * 60 * 1000 });
+const forgotLimiter = rateLimit({ key: 'forgot', max: 4, windowMs: 15 * 60 * 1000 });
+const resetLimiter = rateLimit({ key: 'reset', max: 8, windowMs: 15 * 60 * 1000 });
+const passwordLimiter = rateLimit({ key: 'password', max: 6, windowMs: 15 * 60 * 1000 });
+
 function sessionExpiry(): string {
   return new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function currentToken(req: { header(name: string): string | undefined }): string {
+  const header = req.header('authorization') || '';
+  return header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+}
+
+function currentSessionId(req: { header(name: string): string | undefined }): string {
+  return one<{ id: string }>('SELECT id FROM sessions WHERE token_hash = ?', hashToken(currentToken(req)))?.id ?? '';
 }
 
 function publicUser(row: any) {
@@ -31,6 +46,7 @@ function publicUser(row: any) {
 
 authRoutes.post(
   '/login',
+  loginLimiter,
   asyncRoute(async (req, res) => {
     const body = z.object({ email: z.string().email(), password: z.string().min(1) }).parse(req.body);
     const email = body.email.trim().toLowerCase();
@@ -83,6 +99,7 @@ authRoutes.post(
 
 authRoutes.post(
   '/forgot-password',
+  forgotLimiter,
   asyncRoute(async (req, res) => {
     const body = z.object({ email: z.string().email() }).parse(req.body);
     const user = one<{ id: string; company_id: string; email: string }>(
@@ -93,6 +110,7 @@ authRoutes.post(
       res.json({ message: 'Se o e-mail existir, um link de recuperação será enviado.', emailSent: false });
       return;
     }
+    run('UPDATE password_resets SET used_at = ? WHERE user_id = ? AND used_at IS NULL', now(), user.id);
     const token = randomBytes(32).toString('base64url');
     run(
       'INSERT INTO password_resets (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)',
@@ -117,6 +135,7 @@ authRoutes.post(
 
 authRoutes.post(
   '/reset-password',
+  resetLimiter,
   asyncRoute(async (req, res) => {
     const body = z.object({ token: z.string().min(10), password: z.string().min(8) }).parse(req.body);
     const reset = one<{ id: string; user_id: string }>(
@@ -126,7 +145,7 @@ authRoutes.post(
     );
     if (!reset) fail(400, 'Token inválido ou expirado.');
     run('UPDATE users SET password_hash = ? WHERE id = ?', bcrypt.hashSync(body.password, 10), reset.user_id);
-    run('UPDATE password_resets SET used_at = ? WHERE id = ?', now(), reset.id);
+    run('UPDATE password_resets SET used_at = ? WHERE user_id = ? AND used_at IS NULL', now(), reset.user_id);
     run('UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL', now(), reset.user_id);
     res.json({ ok: true, message: 'Senha redefinida. Faça login novamente.' });
   })
@@ -135,13 +154,17 @@ authRoutes.post(
 authRoutes.post(
   '/change-password',
   authRequired,
+  passwordLimiter,
   asyncRoute(async (req, res) => {
     const body = z
       .object({ currentPassword: z.string().min(1), newPassword: z.string().min(8) })
       .parse(req.body);
     const user = one<{ password_hash: string }>('SELECT password_hash FROM users WHERE id = ?', auth(req).id);
     if (!user || !bcrypt.compareSync(body.currentPassword, user.password_hash)) fail(400, 'Senha atual incorreta.');
-    run('UPDATE users SET password_hash = ? WHERE id = ?', bcrypt.hashSync(body.newPassword, 10), auth(req).id);
+    transaction(() => {
+      run('UPDATE users SET password_hash = ? WHERE id = ?', bcrypt.hashSync(body.newPassword, 10), auth(req).id);
+      run('UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL AND id <> ?', now(), auth(req).id, currentSessionId(req));
+    });
     logActivity(companyId(req), auth(req).id, 'password_changed', 'auth', auth(req).id);
     res.json({ ok: true });
   })
@@ -187,6 +210,7 @@ authRoutes.post(
   upload.single('avatar'),
   asyncRoute(async (req, res) => {
     if (!req.file) fail(400, 'Nenhuma imagem enviada.');
+    if (!req.file.mimetype.startsWith('image/')) fail(400, 'O avatar deve ser uma imagem.');
     const file = saveFile(companyId(req), auth(req).id, req.file);
     const url = `/api/files/${file.id}/download`;
     run('UPDATE users SET avatar_url = ? WHERE id = ?', url, auth(req).id);

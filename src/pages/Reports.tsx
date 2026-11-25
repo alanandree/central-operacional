@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import { Download, FileText } from 'lucide-react';
+import { Download, FileText, Sparkles } from 'lucide-react';
 import { api, downloadFile } from '../lib/api';
 import { useApp } from '../context/AppContext';
-import { Button, Card, CardHeader, EmptyState, Field, Input, PageHeader, StatCard, Tabs } from '../components/ui';
+import { Badge, Button, Card, CardHeader, EmptyState, Field, Input, PageHeader, Skeleton, StatCard, Tabs } from '../components/ui';
 
 interface SacReport {
   period: { from: string; to: string };
@@ -27,26 +27,39 @@ interface DriverReport {
   byStatus: Array<{ label: string; total: number }>;
 }
 
+interface AiReport {
+  report: string;
+  facts: string;
+  source: 'ia' | 'dados';
+  periodDays: number;
+}
+
 function isoDate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
 export function ReportsPage() {
   const { toast } = useApp();
-  const [tab, setTab] = useState<'sac' | 'drivers'>('sac');
+  const [tab, setTab] = useState<'sac' | 'drivers' | 'ia'>('sac');
   const [from, setFrom] = useState(isoDate(new Date(Date.now() - 30 * 86400000)));
   const [to, setTo] = useState(isoDate(new Date()));
+  const [periodDays, setPeriodDays] = useState(30);
   const [sac, setSac] = useState<SacReport | null>(null);
   const [drivers, setDrivers] = useState<DriverReport | null>(null);
+  const [aiReport, setAiReport] = useState<AiReport | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [aiLoading, setAiLoading] = useState(false);
 
   useEffect(() => {
+    setLoading(true);
     const query = `?from=${from}&to=${to}`;
     Promise.all([api<SacReport>(`/reports/sac${query}`), api<DriverReport>(`/reports/drivers${query}`)])
       .then(([sacData, driverData]) => {
         setSac(sacData);
         setDrivers(driverData);
       })
-      .catch((error) => toast(error instanceof Error ? error.message : 'Erro ao carregar relatórios.', 'error'));
+      .catch((error) => toast(error instanceof Error ? error.message : 'Erro ao carregar relatórios.', 'error'))
+      .finally(() => setLoading(false));
   }, [from, to]);
 
   const exportFile = async (path: string, filename: string) => {
@@ -57,19 +70,53 @@ export function ReportsPage() {
     }
   };
 
+  const generateAiReport = async () => {
+    setAiLoading(true);
+    try {
+      const data = await api<AiReport>('/ai/report', {
+        method: 'POST',
+        body: JSON.stringify({ periodDays: Number(periodDays) })
+      });
+      setAiReport(data);
+    } catch (error) {
+      toast(error instanceof Error ? error.message : 'Erro ao gerar relatório.', 'error');
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
   return (
     <div>
       <PageHeader title="Relatórios" description="Indicadores reais do período selecionado." />
 
       <Card className="mb-6 p-4">
         <div className="flex flex-wrap items-end gap-3">
-          <Field label="De"><Input type="date" value={from} onChange={(event) => setFrom(event.target.value)} /></Field>
-          <Field label="Até"><Input type="date" value={to} onChange={(event) => setTo(event.target.value)} /></Field>
-          <div className="ml-auto"><Tabs tabs={[{ id: 'sac', label: 'SAC' }, { id: 'drivers', label: 'Motoristas' }]} active={tab} onChange={(id) => setTab(id as 'sac' | 'drivers')} /></div>
+          {tab !== 'ia' && (
+            <>
+              <Field label="De"><Input type="date" value={from} onChange={(event) => setFrom(event.target.value)} /></Field>
+              <Field label="Até"><Input type="date" value={to} onChange={(event) => setTo(event.target.value)} /></Field>
+            </>
+          )}
+          {tab === 'ia' && (
+            <Field label="Período (dias)" hint="De 1 a 365 dias">
+              <Input type="number" min={1} max={365} value={periodDays} onChange={(event) => setPeriodDays(Number(event.target.value))} />
+            </Field>
+          )}
+          <div className="ml-auto">
+            <Tabs
+              tabs={[
+                { id: 'sac', label: 'SAC' },
+                { id: 'drivers', label: 'Motoristas' },
+                { id: 'ia', label: 'Relatório executivo' }
+              ]}
+              active={tab}
+              onChange={(id) => setTab(id as 'sac' | 'drivers' | 'ia')}
+            />
+          </div>
         </div>
       </Card>
 
-      {tab === 'sac' && sac && (
+      {tab === 'sac' && (loading && !sac ? <Skeleton className="h-96" /> : sac && (
         <div>
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             <StatCard label="Total" value={sac.total} icon={<FileText className="h-4 w-4" />} tone="info" />
@@ -118,9 +165,9 @@ export function ReportsPage() {
             <Button onClick={() => void exportFile('/reports/sac.pdf', 'relatorio-sac.pdf')}><FileText className="h-4 w-4" /> PDF</Button>
           </div>
         </div>
-      )}
+      ))}
 
-      {tab === 'drivers' && drivers && (
+      {tab === 'drivers' && (loading && !drivers ? <Skeleton className="h-96" /> : drivers && (
         <div>
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             <StatCard label="Total" value={drivers.total} icon={<FileText className="h-4 w-4" />} tone="info" />
@@ -151,6 +198,40 @@ export function ReportsPage() {
             <Button onClick={() => void exportFile('/reports/drivers.pdf', 'relatorio-motoristas.pdf')}><FileText className="h-4 w-4" /> PDF</Button>
           </div>
         </div>
+      ))}
+
+      {tab === 'ia' && (
+        <Card>
+          <CardHeader
+            title="Relatório executivo"
+            description="Gerado a partir de fatos reais; texto por IA apenas se configurada"
+            action={<Button variant="primary" disabled={aiLoading || periodDays < 1 || periodDays > 365} onClick={() => void generateAiReport()}>{aiLoading ? 'Gerando...' : 'Gerar relatório'}</Button>}
+          />
+          <div className="p-5">
+            {aiLoading ? (
+              <Skeleton className="h-48" />
+            ) : aiReport ? (
+              <div className="space-y-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge tone={aiReport.source === 'ia' ? 'success' : 'info'}>
+                    {aiReport.source === 'ia' ? 'IA configurada' : 'Dados reais e regras'}
+                  </Badge>
+                  <span className="text-[11px] text-muted">Últimos {aiReport.periodDays} dias</span>
+                </div>
+                <p className="whitespace-pre-wrap text-sm leading-relaxed text-ink">{aiReport.report}</p>
+                <div className="rounded-lg border border-line bg-canvas p-4">
+                  <p className="text-xs font-medium text-muted">Fatos utilizados</p>
+                  <pre className="mt-2 whitespace-pre-wrap text-xs text-muted">{aiReport.facts}</pre>
+                </div>
+                {aiReport.source !== 'ia' && (
+                  <p className="text-[11px] text-muted">A IA não está configurada; o texto foi montado somente com fatos reais e regras do servidor.</p>
+                )}
+              </div>
+            ) : (
+              <EmptyState icon={<Sparkles className="h-5 w-5" />} title="Nenhum relatório gerado" description="Escolha o período em dias e gere um resumo a partir de dados reais." />
+            )}
+          </div>
+        </Card>
       )}
     </div>
   );

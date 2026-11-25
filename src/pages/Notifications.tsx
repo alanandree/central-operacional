@@ -35,13 +35,13 @@ export function NotificationsPage() {
                 onClick={() => void markOne(item.id)}
                 className="flex w-full items-start gap-3 px-5 py-4 text-left hover:bg-line/20"
               >
-                <span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${item.read_at ? 'bg-line' : 'bg-info'}`} />
+                <span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${item.readAt ? 'bg-line' : 'bg-info'}`} />
                 <div className="min-w-0 flex-1">
                   <p className="text-sm font-medium text-ink">{item.title}</p>
                   {item.body && <p className="mt-1 text-xs text-muted">{item.body}</p>}
-                  <p className="mt-1 text-[11px] text-muted">{formatDate(item.created_at)}</p>
+                  <p className="mt-1 text-[11px] text-muted">{formatDate(item.createdAt)}</p>
                 </div>
-                {!item.read_at && <span className="text-[11px] text-info">marcar como lida</span>}
+                {!item.readAt && <span className="text-[11px] text-info">marcar como lida</span>}
               </button>
             ))
           )}

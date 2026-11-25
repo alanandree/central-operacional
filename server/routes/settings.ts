@@ -1,8 +1,8 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
-import { adminRequired, asyncRoute, auth, authRequired, companyId, fail } from '../core.ts';
-import { all, getSetting, logActivity, newId, now, one, run, setSetting } from '../db.ts';
+import { adminRequired, asyncRoute, auth, authRequired, companyId, fail, hashToken } from '../core.ts';
+import { all, getSetting, logActivity, newId, notifyAdmins, now, one, run, setSetting } from '../db.ts';
 
 export const settingsRoutes = Router();
 
@@ -72,6 +72,7 @@ settingsRoutes.patch(
     }
     if (fields.length === 0) fail(400, 'Nenhum campo informado.');
     run(`UPDATE occurrence_categories SET ${fields.join(', ')} WHERE id = ?`, ...values, category.id);
+    logActivity(companyId(req), auth(req).id, 'category_updated', 'category', category.id, body);
     res.json({ ok: true });
   })
 );
@@ -104,7 +105,12 @@ settingsRoutes.get(
       slaDefaultHours: getSetting(company, 'sla_default_hours', 48),
       businessHours: getSetting(company, 'business_hours', { start: '08:00', end: '18:00', days: [1, 2, 3, 4, 5] }),
       notificationOffsets: getSetting(company, 'notification_offsets', [24, 12, 2, 0]),
-      whatsappGroupSupport: getSetting(company, 'whatsapp_group_support', 'unknown')
+      whatsappGroupSupport: getSetting(company, 'whatsapp_group_support', 'unknown'),
+      holidays: getSetting<string[]>(company, 'holidays', []),
+      slaPriorityFactor: getSetting<Record<string, number>>(company, 'sla_priority_factor', { Baixa: 1.5, Normal: 1, Alta: 0.5, Urgente: 0.25 }),
+      slaPauseStatuses: getSetting<string[]>(company, 'sla_pause_statuses', ['Aguardando cliente', 'Aguardando transportadora', 'Aguardando motorista']),
+      documentAlertDays: getSetting<number>(company, 'document_alert_days', 30),
+      retentionDays: getSetting<number>(company, 'retention_days', 365)
     });
   })
 );
@@ -122,19 +128,40 @@ settingsRoutes.patch(
           .object({
             start: z.string().regex(/^\d{2}:\d{2}$/),
             end: z.string().regex(/^\d{2}:\d{2}$/),
-            days: z.array(z.number().int().min(0).max(6))
+            days: z.array(z.number().int().min(0).max(6)).min(1)
           })
           .optional(),
+        holidays: z.array(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).optional(),
+        slaPriorityFactor: z
+          .object({
+            Baixa: z.number().positive(),
+            Normal: z.number().positive(),
+            Alta: z.number().positive(),
+            Urgente: z.number().positive()
+          })
+          .optional(),
+        slaPauseStatuses: z.array(z.string().min(2)).optional(),
         notificationOffsets: z.array(z.number().int().min(0).max(168)).optional(),
-        whatsappGroupSupport: z.enum(['unknown', 'yes', 'no']).optional()
+        whatsappGroupSupport: z.enum(['unknown', 'yes', 'no']).optional(),
+        documentAlertDays: z.number().int().min(1).max(365).optional(),
+        retentionDays: z.number().int().min(30).max(3650).optional()
       })
       .parse(req.body);
+    if (body.businessHours) {
+      if (body.businessHours.start >= body.businessHours.end) fail(400, 'O horário de abertura deve ser anterior ao fechamento.');
+      if (new Set(body.businessHours.days).size !== body.businessHours.days.length) fail(400, 'Há dias úteis duplicados.');
+    }
     const company = companyId(req);
     if (body.companyName) run('UPDATE companies SET name = ? WHERE id = ?', body.companyName.trim(), company);
     if (body.slaDefaultHours !== undefined) setSetting(company, 'sla_default_hours', body.slaDefaultHours);
     if (body.businessHours) setSetting(company, 'business_hours', body.businessHours);
+    if (body.holidays) setSetting(company, 'holidays', [...new Set(body.holidays)].sort());
+    if (body.slaPriorityFactor) setSetting(company, 'sla_priority_factor', body.slaPriorityFactor);
+    if (body.slaPauseStatuses) setSetting(company, 'sla_pause_statuses', [...new Set(body.slaPauseStatuses)]);
     if (body.notificationOffsets) setSetting(company, 'notification_offsets', body.notificationOffsets);
     if (body.whatsappGroupSupport) setSetting(company, 'whatsapp_group_support', body.whatsappGroupSupport);
+    if (body.documentAlertDays !== undefined) setSetting(company, 'document_alert_days', body.documentAlertDays);
+    if (body.retentionDays !== undefined) setSetting(company, 'retention_days', body.retentionDays);
     logActivity(company, auth(req).id, 'settings_updated', 'settings', company, body);
     res.json({ ok: true });
   })
@@ -227,6 +254,11 @@ settingsRoutes.patch(
     if (fields.length === 0) fail(400, 'Nenhum campo informado.');
     try {
       run(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, ...values, user.id);
+      if (body.password) {
+        const header = req.header('authorization') || '';
+        const currentHash = hashToken(header.startsWith('Bearer ') ? header.slice(7).trim() : '');
+        run('UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL AND token_hash <> ?', now(), user.id, currentHash);
+      }
     } catch {
       fail(409, 'Este e-mail já está em uso.');
     }
@@ -248,3 +280,74 @@ settingsRoutes.delete(
     res.json({ ok: true });
   })
 );
+
+settingsRoutes.get(
+  '/privacy/export',
+  authRequired,
+  asyncRoute(async (req, res) => {
+    const company = companyId(req);
+    const user = one<any>(
+      'SELECT id, name, email, role, avatar_url, created_at, last_login_at FROM users WHERE id = ? AND company_id = ?',
+      auth(req).id,
+      company
+    );
+    if (!user) fail(404, 'Usuário não encontrado.');
+    res.json({
+      generatedAt: now(),
+      user: { ...user, avatarUrl: user.avatar_url ?? null },
+      occurrences: all<any>('SELECT id, number, customer_name, description, received_at, created_at FROM occurrences WHERE company_id = ? AND created_by = ?', company, user.id),
+      drivers: all<any>('SELECT id, name, cpf, phone, email, created_at FROM drivers WHERE company_id = ? AND created_by = ?', company, user.id),
+      activity: all<any>('SELECT action, entity, entity_id, created_at FROM activity_logs WHERE company_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 500', company, user.id)
+    });
+  })
+);
+
+settingsRoutes.get(
+  '/privacy-requests',
+  authRequired,
+  adminRequired,
+  asyncRoute(async (req, res) => {
+    const requests = all<any>(
+      'SELECT id, user_id, type, status, subject_name, created_at, completed_at FROM privacy_requests WHERE company_id = ? ORDER BY created_at DESC',
+      companyId(req)
+    );
+    res.json({ requests });
+  })
+);
+
+settingsRoutes.post(
+  '/privacy-requests',
+  authRequired,
+  asyncRoute(async (req, res) => {
+    const body = z.object({
+      type: z.enum(['exportacao', 'exclusao']),
+      subjectName: z.string().min(2),
+      details: z.string().max(500).optional()
+    }).parse(req.body);
+    const company = companyId(req);
+    const id = newId();
+    run(
+      'INSERT INTO privacy_requests (id, company_id, user_id, type, status, subject_name, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      id, company, auth(req).id, body.type, 'pendente', body.subjectName.trim(), clean(body.details), now()
+    );
+    notifyAdmins(company, 'Solicitação de LGPD', `${body.type === 'exportacao' ? 'Exportação' : 'Exclusão'} de dados: ${body.subjectName}`);
+    res.status(201).json({ id, status: 'pendente' });
+  })
+);
+
+settingsRoutes.patch(
+  '/privacy-requests/:id/complete',
+  authRequired,
+  adminRequired,
+  asyncRoute(async (req, res) => {
+    const requestRow = one<{ id: string }>('SELECT id FROM privacy_requests WHERE id = ? AND company_id = ?', req.params.id, companyId(req));
+    if (!requestRow) fail(404, 'Solicitação não encontrada.');
+    run('UPDATE privacy_requests SET status = ?, completed_at = ? WHERE id = ?', 'concluida', now(), requestRow.id);
+    logActivity(companyId(req), auth(req).id, 'privacy_request_completed', 'privacy', requestRow.id);
+    res.json({ ok: true });
+  })
+);
+
+function clean(value: string | undefined): string | null {
+  return value && value.trim() ? value.trim() : null;
+}

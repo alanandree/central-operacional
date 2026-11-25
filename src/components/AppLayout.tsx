@@ -245,10 +245,10 @@ export function AppLayout() {
                         >
                           <div className="flex w-full items-center justify-between gap-2">
                             <span className="text-xs font-medium text-ink">{item.title}</span>
-                            {!item.read_at && <span className="h-1.5 w-1.5 rounded-full bg-info" />}
+                            {!item.readAt && <span className="h-1.5 w-1.5 rounded-full bg-info" />}
                           </div>
                           {item.body && <span className="line-clamp-2 text-[11px] text-muted">{item.body}</span>}
-                          <span className="text-[10px] text-muted">{relativeTime(item.created_at)}</span>
+                          <span className="text-[10px] text-muted">{relativeTime(item.createdAt)}</span>
                         </button>
                       ))
                     )}

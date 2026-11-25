@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { config } from './config.ts';
 import { errorHandler } from './core.ts';
+import { securityHeaders } from './security.ts';
 import { authRoutes } from './routes/auth.ts';
 import { occurrenceRoutes } from './routes/occurrences.ts';
 import { driverRoutes } from './routes/drivers.ts';
@@ -20,11 +21,8 @@ import { aiRoutes } from './routes/ai.ts';
 const app = express();
 app.disable('x-powered-by');
 
-const allowedOrigins = process.env.CORS_ORIGIN
-  ? process.env.CORS_ORIGIN.split(',').map((item) => item.trim()).filter(Boolean)
-  : true;
-
-app.use(cors({ origin: allowedOrigins, credentials: true }));
+app.use(securityHeaders);
+app.use(cors({ origin: config.corsOrigins.length ? config.corsOrigins : false, credentials: true }));
 app.use(
   express.json({
     limit: '4mb',

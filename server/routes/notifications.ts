@@ -16,7 +16,17 @@ notificationRoutes.get(
       auth(req).id
     );
     const unread = notifications.filter((item) => !item.read_at).length;
-    res.json({ notifications, unread });
+    res.json({
+      notifications: notifications.map((item) => ({
+        id: item.id,
+        type: item.type,
+        title: item.title,
+        body: item.body ?? null,
+        readAt: item.read_at ?? null,
+        createdAt: item.created_at
+      })),
+      unread
+    });
   })
 );
 

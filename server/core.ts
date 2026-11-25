@@ -1,6 +1,6 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import jwt from 'jsonwebtoken';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { config } from './config.ts';
 import { now, one } from './db.ts';
 
@@ -43,8 +43,17 @@ export function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
 
+const jwtIssuer = 'central-operacional';
+const jwtAudience = 'central-operacional-web';
+
 export function signToken(userId: string): string {
-  return jwt.sign({ sub: userId }, config.jwtSecret, { expiresIn: '7d' });
+  return jwt.sign({ sub: userId }, config.jwtSecret, {
+    algorithm: 'HS256',
+    issuer: jwtIssuer,
+    audience: jwtAudience,
+    jwtid: randomUUID(),
+    expiresIn: '7d'
+  });
 }
 
 export function auth(req: Request): AuthUser {
@@ -62,7 +71,11 @@ export const authRequired: RequestHandler = (req, res, next) => {
     if (!token) fail(401, 'Não autenticado.');
     let payload: jwt.JwtPayload;
     try {
-      payload = jwt.verify(token, config.jwtSecret) as jwt.JwtPayload;
+      payload = jwt.verify(token, config.jwtSecret, {
+        algorithms: ['HS256'],
+        issuer: jwtIssuer,
+        audience: jwtAudience
+      }) as jwt.JwtPayload;
     } catch {
       fail(401, 'Sessão inválida ou expirada.');
     }
@@ -110,6 +123,12 @@ export function errorHandler(error: unknown, req: Request, res: Response, next: 
   if (error && typeof error === 'object' && 'status' in error && typeof (error as { status: unknown }).status === 'number') {
     const integrationError = error as { status: number; message: string };
     res.status(integrationError.status).json({ error: integrationError.message });
+    return;
+  }
+  if (error && typeof error === 'object' && (error as { name?: string }).name === 'MulterError') {
+    const multerError = error as { code?: string; message: string };
+    const status = multerError.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+    res.status(status).json({ error: status === 413 ? 'Arquivo maior que o limite permitido.' : multerError.message });
     return;
   }
   if (error && typeof error === 'object' && 'issues' in error) {

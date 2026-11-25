@@ -20,6 +20,11 @@ function jwtSecret(): string {
 export const config = {
   port: Number(process.env.PORT || 4000),
   isProd: process.env.NODE_ENV === 'production',
+  corsOrigins: (process.env.CORS_ORIGIN || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean),
+  appUrl: process.env.APP_URL || (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5173'),
   jwtSecret: jwtSecret(),
   adminName: process.env.ADMIN_NAME || 'Administradora',
   adminEmail: process.env.ADMIN_EMAIL || 'admin@empresa.com',

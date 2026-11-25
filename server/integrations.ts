@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { config } from './config.ts';
-import { getSetting, newId, now, one, run } from './db.ts';
+import { getSetting, now, one, run } from './db.ts';
 
 export class IntegrationError extends Error {
   status: number;
@@ -15,8 +15,8 @@ export function whatsappConfigured(): boolean {
 }
 
 export function whatsappStatus(companyId: string) {
-  const row = one<{ display_number: string | null; last_sync_at: string | null; notes: string | null }>(
-    'SELECT display_number, last_sync_at, notes FROM whatsapp_integrations WHERE company_id = ? AND provider = ?',
+  const row = one<{ status: string; display_number: string | null; last_sync_at: string | null; notes: string | null }>(
+    'SELECT status, display_number, last_sync_at, notes FROM whatsapp_integrations WHERE company_id = ? AND provider = ?',
     companyId,
     'cloud_api'
   );
@@ -31,7 +31,8 @@ export function whatsappStatus(companyId: string) {
   return {
     provider: 'WhatsApp Business Cloud API',
     configured,
-    status: configured ? 'connected' : 'not_configured',
+    verified: row?.status === 'verified',
+    status: configured ? (row?.status === 'verified' ? 'verified' : 'credentials_present') : 'not_configured',
     displayNumber: row?.display_number ?? null,
     lastSyncAt: row?.last_sync_at ?? null,
     notes: row?.notes ?? null,
@@ -46,7 +47,7 @@ export function whatsappStatus(companyId: string) {
 export function markWhatsappSync(companyId: string): void {
   run(
     'UPDATE whatsapp_integrations SET status = ?, last_sync_at = ?, updated_at = ? WHERE company_id = ? AND provider = ?',
-    whatsappConfigured() ? 'connected' : 'not_configured',
+    whatsappConfigured() ? 'credentials_present' : 'not_configured',
     now(),
     now(),
     companyId,
@@ -85,7 +86,9 @@ export async function sendWhatsAppText(to: string, body: string): Promise<string
     const message = (data as { error?: { message?: string } }).error?.message ?? `Falha na API (${response.status}).`;
     throw new IntegrationError(502, message);
   }
-  return String((data as { messages?: Array<{ id?: string }> }).messages?.[0]?.id ?? newId());
+  const messageId = (data as { messages?: Array<{ id?: string }> }).messages?.[0]?.id;
+  if (!messageId) throw new IntegrationError(502, 'A API do WhatsApp não devolveu o ID da mensagem enviada.');
+  return String(messageId);
 }
 
 export function aiConfigured(): boolean {
@@ -97,7 +100,15 @@ export function aiStatus() {
     configured: aiConfigured(),
     provider: config.ai.apiKey ? 'API compatível com OpenAI' : 'não configurada',
     model: config.ai.apiKey ? config.ai.model : null,
-    capabilities: ['classificação de ocorrências', 'extração de campos', 'resumo', 'sugestão de resposta', 'detecção de duplicidade']
+    capabilities: [
+      'classificação de ocorrências',
+      'extração de campos',
+      'sugestão de categoria e prioridade',
+      'resumo de histórico',
+      'sugestão de resposta',
+      'ocorrências semelhantes',
+      'relatórios em linguagem natural'
+    ]
   };
 }
 
@@ -147,7 +158,7 @@ export async function callAIText(system: string, user: string): Promise<string> 
 
 export async function sendResetEmail(to: string, token: string): Promise<{ sent: boolean; reason?: string }> {
   if (!config.resendApiKey) return { sent: false, reason: 'EMAIL_PROVIDER_NOT_CONFIGURED' };
-  const appUrl = process.env.APP_URL || 'http://localhost:5173';
+  const appUrl = config.appUrl;
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
@@ -163,4 +174,82 @@ export async function sendResetEmail(to: string, token: string): Promise<{ sent:
   });
   if (!response.ok) throw new IntegrationError(502, 'Falha ao enviar e-mail de recuperação.');
   return { sent: true };
+}
+
+export async function verifyWhatsappCredentials(companyId: string): Promise<{ verified: boolean; displayNumber: string | null }> {
+  if (!config.whatsapp.accessToken || !config.whatsapp.phoneNumberId) {
+    throw new IntegrationError(503, 'Credenciais do WhatsApp incompletas.');
+  }
+  const url = `https://graph.facebook.com/${config.whatsapp.apiVersion}/${config.whatsapp.phoneNumberId}?fields=verified_name,display_phone_number`;
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${config.whatsapp.accessToken}` },
+    signal: AbortSignal.timeout(20000)
+  });
+  const data = await response.json().catch(() => ({})) as { display_phone_number?: string; error?: { message?: string } };
+  if (!response.ok) throw new IntegrationError(502, data.error?.message ?? 'Não foi possível validar as credenciais do WhatsApp.');
+  const displayNumber = data.display_phone_number ?? null;
+  run(
+    'UPDATE whatsapp_integrations SET status = ?, display_number = ?, last_sync_at = ?, updated_at = ? WHERE company_id = ? AND provider = ?',
+    'verified',
+    displayNumber,
+    now(),
+    now(),
+    companyId,
+    'cloud_api'
+  );
+  return { verified: true, displayNumber };
+}
+
+export async function downloadWhatsappMedia(mediaId: string): Promise<{ buffer: Buffer; mime: string; filename: string }> {
+  if (!config.whatsapp.accessToken) throw new IntegrationError(503, 'WhatsApp não configurado.');
+  const metaResponse = await fetch(`https://graph.facebook.com/${config.whatsapp.apiVersion}/${mediaId}`, {
+    headers: { Authorization: `Bearer ${config.whatsapp.accessToken}` },
+    signal: AbortSignal.timeout(20000)
+  });
+  const meta = await metaResponse.json().catch(() => ({})) as {
+    url?: string;
+    mime_type?: string;
+    filename?: string;
+    error?: { message?: string };
+  };
+  if (!metaResponse.ok || !meta.url) throw new IntegrationError(502, meta.error?.message ?? 'Não foi possível localizar a mídia no WhatsApp.');
+  const fileResponse = await fetch(meta.url, {
+    headers: { Authorization: `Bearer ${config.whatsapp.accessToken}` },
+    signal: AbortSignal.timeout(30000)
+  });
+  if (!fileResponse.ok) throw new IntegrationError(502, 'Não foi possível baixar a mídia do WhatsApp.');
+  const buffer = Buffer.from(await fileResponse.arrayBuffer());
+  if (buffer.length > 15 * 1024 * 1024) throw new IntegrationError(413, 'Mídia maior que o limite permitido.');
+  return {
+    buffer,
+    mime: meta.mime_type || fileResponse.headers.get('content-type') || 'application/octet-stream',
+    filename: meta.filename || `midia-${mediaId}`
+  };
+}
+
+export async function sendWhatsAppTemplate(
+  to: string,
+  templateName: string,
+  language = 'pt_BR'
+): Promise<string> {
+  if (!whatsappConfigured()) throw new IntegrationError(503, 'WhatsApp não configurado.');
+  const response = await fetch(`https://graph.facebook.com/${config.whatsapp.apiVersion}/${config.whatsapp.phoneNumberId}/messages`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${config.whatsapp.accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      to,
+      type: 'template',
+      template: { name: templateName, language: { code: language } }
+    }),
+    signal: AbortSignal.timeout(20000)
+  });
+  const data = await response.json().catch(() => ({})) as { messages?: Array<{ id?: string }>; error?: { message?: string } };
+  if (!response.ok) throw new IntegrationError(502, data.error?.message ?? 'Falha ao enviar template.');
+  const messageId = data.messages?.[0]?.id;
+  if (!messageId) throw new IntegrationError(502, 'A API do WhatsApp não devolveu o ID do template enviado.');
+  return messageId;
 }
